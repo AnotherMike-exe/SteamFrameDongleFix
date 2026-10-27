@@ -12,14 +12,14 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: shellcheck
         run: shellcheck -x bin/steam-frame-dongle
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install bats
         run: sudo apt-get update && sudo apt-get install -y bats
       - name: Unit tests
@@ -37,7 +37,7 @@ jobs:
       # Secrets are not allowed in `if:`, so test them through env. Forks have no key.
       HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: anthropics/claude-code-action@v1
         if: env.HAS_ANTHROPIC_KEY == 'true'
         with:
