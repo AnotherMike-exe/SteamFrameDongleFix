@@ -1,0 +1,45 @@
+name: Review
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x bin/steam-frame-dongle
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Unit tests
+        run: bats tests/Unit
+      # No integration tests in CI: they need the physical Steam Frame adapter.
+      # Run `sudo steam-frame-dongle selftest` on real hardware instead.
+
+  claude-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      # Secrets are not allowed in `if:`, so test them through env. Forks have no key.
+      HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: anthropics/claude-code-action@v1
+        if: env.HAS_ANTHROPIC_KEY == 'true'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: "Review this PR for correctness, security and adherence to the project's conventions. The CLI runs as root and writes to /etc and debugfs: check every path and every restore path."

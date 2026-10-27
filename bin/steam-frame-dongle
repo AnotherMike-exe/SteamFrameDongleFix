@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+# steam-frame-dongle - workarounds for the system-wide network stalls that the
+# Valve Steam Frame wireless adapter (USB 28de:2432, Realtek RTL8852CU,
+# driver rtw89_8852cu) causes on Linux.
+#
+# https://github.com/AnotherMike-exe/SteamFrameDongleFix
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+VERSION="0.1.0"
+PROG="steam-frame-dongle"
+USB_VENDOR="28de"
+USB_PRODUCT="2432"
+DM_IPS_BIT=$((1 << 5))        # RTW89_DM_INACTIVE_PS in rtw89 disable_dm
+STALL_THRESHOLD_MS=3000       # a stall longer than this freezes games and Plasma
+PROFILE="${SFD_PROFILE:-Steam Frame Wireless Adapter}"
+DESTDIR="${DESTDIR:-}"
+
+BIN_PATH="/usr/local/bin/$PROG"
+NM_CONF="/etc/NetworkManager/conf.d/90-$PROG.conf"
+UDEV_RULE="/etc/udev/rules.d/90-$PROG.rules"
+JOURNALD_CONF="/etc/systemd/journald.conf.d/90-$PROG.conf"
+PACMAN_HOOK="/etc/pacman.d/hooks/90-$PROG.hook"
+
+# Repository source -> installed path. One line per file.
+install_map() {
+    cat <<EOF
+bin/$PROG $BIN_PATH 0755
+Install/NetworkManager/90-$PROG.conf $NM_CONF 0644
+Install/Udev/90-$PROG.rules $UDEV_RULE 0644
+Install/Journald/90-$PROG.conf $JOURNALD_CONF 0644
+Install/Pacman/90-$PROG.hook $PACMAN_HOOK 0644
+EOF
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG <command>
+
+Commands:
+  status            Show which workarounds are installed and active.
+  selftest [--yes] [--skip-mac] [--profile NAME]
+                    Measure whether each workaround is still needed. Takes
+                    about 4 minutes and causes network stalls of up to 15 s.
+                    Do not run it during a game. The headset must be asleep.
+  install           Install the workarounds. Run it from the repository.
+  uninstall         Remove every installed file and turn the workarounds off.
+  replug            Detach and attach the dongle again over USB, so that
+                    NetworkManager reads its device settings again.
+  version           Show the version.
+  help              Show this help.
+
+Environment:
+  SFD_PROFILE       NetworkManager profile that Steam uses for the dongle.
+                    Default: "Steam Frame Wireless Adapter". sudo removes
+                    environment variables, so use --profile or "sudo env".
+  DESTDIR           Install into or uninstall from this root (packaging, tests).
+EOF
+}
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+need_root() {
+    [ -n "$DESTDIR" ] && return 0
+    [ "$(id -u)" -eq 0 ] || die "run this command as root (sudo $PROG $1)"
+}
+
+# ---- disable_dm bitmap helpers ------------------------------------------
+
+dm_parse() {   # "Disabled DM: 0x20" -> 0x20
+    local hex
+    hex=$(printf '%s\n' "$1" | grep -oE '0x[0-9a-fA-F]+' | head -n 1)
+    [ -n "$hex" ] || return 1
+    printf '%s\n' "$hex"
+}
+dm_set_ips()   { printf '0x%x\n' $(( $1 | DM_IPS_BIT )); }
+dm_clear_ips() { printf '0x%x\n' $(( $1 & ~DM_IPS_BIT )); }
+dm_has_ips()   { [ $(( $1 & DM_IPS_BIT )) -ne 0 ]; }
+
+verdict() {   # max stall in ms -> verdict text
+    if [ "$1" -gt "$STALL_THRESHOLD_MS" ]; then
+        echo "still needed"
+    else
+        echo "not needed on this kernel"
+    fi
+}
+
+# ---- dongle discovery ---------------------------------------------------
+
+# The USB device directory for an interface, or nothing.
+usb_dir_of() {
+    local dev
+    dev=$(readlink -f "/sys/class/net/$1/device" 2>/dev/null) || return 1
+    dev=$(dirname "$dev")
+    [ -f "$dev/idVendor" ] || return 1
+    printf '%s\n' "$dev"
+}
+
+# Print the interface name of the first Steam Frame adapter.
+find_iface() {
+    local n dir
+    for n in /sys/class/net/*; do
+        n=$(basename "$n")
+        dir=$(usb_dir_of "$n") || continue
+        if [ "$(cat "$dir/idVendor")" = "$USB_VENDOR" ] &&
+           [ "$(cat "$dir/idProduct")" = "$USB_PRODUCT" ]; then
+            printf '%s\n' "$n"
+            return 0
+        fi
+    done
+    return 1
+}
+
+phy_of() { basename "$(readlink -f "/sys/class/net/$1/phy80211")"; }
+
+ensure_debugfs() {
+    mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+}
+
+dm_file_of() {
+    ensure_debugfs
+    printf '/sys/kernel/debug/ieee80211/%s/rtw89/disable_dm\n' "$(phy_of "$1")"
+}
+
+dm_read() { dm_parse "$(head -n 1 "$(dm_file_of "$1")")"; }
+
+dm_write() {   # iface value
+    printf '%s\n' "$2" 2>/dev/null > "$(dm_file_of "$1")"
+}
+
+# Why a debugfs write can fail, for the error message.
+debugfs_hint() {
+    if grep -qE '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown 2>/dev/null; then
+        echo "kernel lockdown (Secure Boot) blocks debugfs writes"
+    else
+        echo "the kernel needs Linux 7.2+ with CONFIG_RTW89_DEBUGFS=y"
+    fi
+}
+
+ips_off() {
+    local cur
+    if cur=$(dm_read "$1" 2>/dev/null) && dm_write "$1" "$(dm_set_ips "$cur")" &&
+       dm_has_ips "$(dm_read "$1")"; then
+        return 0
+    fi
+    warn "could not turn off inactive power save on $1: $(debugfs_hint)"
+    return 1
+}
+ips_on() {
+    local cur
+    if cur=$(dm_read "$1" 2>/dev/null) && dm_write "$1" "$(dm_clear_ips "$cur")" &&
+       ! dm_has_ips "$(dm_read "$1")"; then
+        return 0
+    fi
+    warn "could not turn on inactive power save on $1: $(debugfs_hint)"
+    return 1
+}
+
+mac_randomized() { ip link show dev "$1" | grep -q permaddr; }
+
+nm_config_loaded() {
+    NetworkManager --print-config 2>/dev/null | grep -q "^\[device-steam-frame-dongle\]"
+}
+
+journal_cap() {
+    systemd-analyze cat-config systemd/journald.conf 2>/dev/null |
+        grep -E '^SystemMaxUse=' | tail -n 1 | cut -d= -f2
+}
+
+# ---- interrupt safety ---------------------------------------------------
+
+# A USB port that replug detached. on_exit attaches it again.
+PENDING_AUTH=""
+# The workaround that selftest turned off: "", "ips" or "mac".
+SELFTEST_RESTORE=""
+
+# Attach every Steam Frame adapter that is detached (authorized=0).
+reauthorize_all() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ -f "$d/idVendor" ] && [ -f "$d/authorized" ] || continue
+        [ "$(cat "$d/idVendor")" = "$USB_VENDOR" ] || continue
+        [ "$(cat "$d/idProduct")" = "$USB_PRODUCT" ] || continue
+        [ "$(cat "$d/authorized")" = "0" ] && echo 1 > "$d/authorized"
+    done
+    return 0
+}
+
+# Put the NetworkManager config back if an earlier selftest was killed.
+recover_stale() {
+    local conf="$DESTDIR$NM_CONF"
+    [ -e "$conf.selftest" ] || return 0
+    if [ -e "$conf" ]; then
+        rm -f "$conf.selftest"
+    else
+        mv "$conf.selftest" "$conf"
+        warn "restored $conf from an interrupted selftest"
+        [ -z "$DESTDIR" ] && nmcli general reload conf > /dev/null 2>&1
+    fi
+    return 0
+}
+
+# 1 while selftest runs. on_exit then makes sure every workaround is on.
+SELFTEST_ACTIVE=0
+
+on_exit() {
+    trap '' INT TERM HUP    # a second signal must not stop the restore
+    pkill -P $$ 2> /dev/null
+    if [ -n "$PENDING_AUTH" ]; then
+        echo 1 > "$PENDING_AUTH" 2> /dev/null
+        PENDING_AUTH=""
+    fi
+    selftest_restore
+    if [ "$SELFTEST_ACTIVE" -eq 1 ]; then
+        SELFTEST_ACTIVE=0
+        selftest_enforce
+    fi
+}
+
+# Make INT, TERM and HUP end the script, so that on_exit runs one time.
+arm_traps() {
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    trap on_exit EXIT
+}
+
+# ---- commands -----------------------------------------------------------
+
+cmd_udev_apply() {   # called by udev with the interface name
+    local iface="$1" f i
+    f=$(dm_file_of "$iface") || exit 1
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -w "$f" ] && break
+        sleep 1
+    done
+    if ! ips_off "$iface" 2>/dev/null; then
+        logger -t "$PROG" "$iface: could not turn off inactive power save: $(debugfs_hint)"
+        exit 1
+    fi
+    logger -t "$PROG" "$iface ($(phy_of "$iface")): inactive power save off, $(head -n 1 "$f")"
+}
+
+cmd_hook_notice() {
+    cat <<EOF
+==> Steam Frame dongle: the kernel changed.
+    Upstream fixes can make the workarounds unnecessary. To check, put the
+    headset to sleep, close games, and run:  sudo $PROG selftest
+EOF
+}
+
+cmd_replug() {
+    need_root replug
+    local iface dir i
+    reauthorize_all
+    iface=$(find_iface) || die "no Steam Frame adapter ($USB_VENDOR:$USB_PRODUCT) found"
+    dir=$(usb_dir_of "$iface")
+    log "Detaching $(basename "$dir") ($iface)..."
+    PENDING_AUTH="$dir/authorized"
+    echo 0 > "$dir/authorized"
+    sleep 2
+    echo 1 > "$dir/authorized"
+    PENDING_AUTH=""
+    for i in $(seq 1 60); do
+        iface=$(find_iface) &&
+            nmcli -t -f DEVICE,STATE device 2>/dev/null | grep -qE "^$iface:(disconnected|connected)" &&
+            { log "Attached again as $iface after about $((i * 2)) s."; return 0; }
+        sleep 2
+    done
+    die "the adapter did not come back within 120 s"
+}
+
+cmd_install() {
+    need_root install
+    local repo src dst mode
+    repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+    [ -f "$repo/Install/Udev/90-$PROG.rules" ] ||
+        die "run install from the repository: sudo ./bin/$PROG install"
+    recover_stale
+    while read -r src dst mode; do
+        if [ "$dst" = "$PACMAN_HOOK" ] && [ -z "$DESTDIR" ] && [ ! -d /etc/pacman.d ]; then
+            log "skip  $dst (no pacman on this system)"
+            continue
+        fi
+        mkdir -p "$DESTDIR$(dirname "$dst")"
+        # Copy, then rename: a running copy of the old script keeps its inode.
+        if ! { cp "$repo/$src" "$DESTDIR$dst.new" &&
+               chmod "$mode" "$DESTDIR$dst.new" &&
+               mv -f "$DESTDIR$dst.new" "$DESTDIR$dst"; }; then
+            die "could not write $DESTDIR$dst"
+        fi
+        log "write $DESTDIR$dst"
+    done < <(install_map)
+    [ -n "$DESTDIR" ] && return 0
+
+    udevadm control --reload
+    nmcli general reload conf
+    systemctl restart systemd-journald
+    local iface
+    if iface=$(find_iface); then
+        if ips_off "$iface"; then
+            log "Inactive power save is off on $iface."
+        else
+            log "WARNING: the inactive power save workaround is not active. See the message above."
+        fi
+        log "Run 'sudo $PROG replug' or reboot so that NetworkManager keeps the permanent MAC."
+    else
+        log "No adapter found. Plug it in. The workarounds apply automatically."
+    fi
+}
+
+cmd_uninstall() {
+    need_root uninstall
+    local src dst mode
+    while read -r src dst mode; do
+        if [ -e "$DESTDIR$dst" ]; then
+            rm -f "$DESTDIR$dst"
+            log "remove $DESTDIR$dst"
+        fi
+    done < <(install_map)
+    rm -f "$DESTDIR$NM_CONF.selftest"
+    [ -n "$DESTDIR" ] && return 0
+
+    udevadm control --reload
+    nmcli general reload conf
+    systemctl restart systemd-journald
+    local iface
+    if iface=$(find_iface); then
+        ips_on "$iface" && log "Inactive power save is back on for $iface."
+        log "Replug the adapter or reboot so that NetworkManager uses its default MAC settings."
+    fi
+}
+
+cmd_status() {
+    need_root status
+    local src dst mode iface dm sband
+    recover_stale
+    log "$PROG $VERSION   kernel $(uname -r)"
+    log ""
+    log "Installed files:"
+    while read -r src dst mode; do
+        if [ -e "$DESTDIR$dst" ]; then log "  [x] $dst"; else log "  [ ] $dst"; fi
+    done < <(install_map)
+    log ""
+    if ! iface=$(find_iface); then
+        log "Adapter: not plugged in ($USB_VENDOR:$USB_PRODUCT)."
+        return 0
+    fi
+    log "Adapter: $iface ($(phy_of "$iface")), driver $(basename "$(readlink -f "/sys/class/net/$iface/device/driver")")"
+    if nm_config_loaded; then log "  NetworkManager config loaded:   yes"; else log "  NetworkManager config loaded:   no"; fi
+    if mac_randomized "$iface"; then
+        log "  MAC address:                    randomized (replug to apply the config)"
+    else
+        log "  MAC address:                    permanent"
+    fi
+    dm=$(dm_read "$iface") || dm="unreadable"
+    if [ "$dm" != "unreadable" ] && dm_has_ips "$dm"; then
+        log "  Inactive power save:            off (disable_dm $dm)"
+    else
+        log "  Inactive power save:            ON (disable_dm $dm) - stalls likely"
+    fi
+    log "  Journal size cap:               $(journal_cap)"
+    sband=$(sband_since "-60s")
+    log "  2.4 GHz kernel warnings:        $sband in the last 60 s"
+}
+
+MC_TMP="" MC_SAMPLER=""
+measure_cycle_cleanup() {
+    [ -n "$MC_SAMPLER" ] && kill "$MC_SAMPLER" 2> /dev/null
+    [ -n "$MC_TMP" ] && rm -rf "$MC_TMP"
+    return 0
+}
+
+# Count the 2.4 GHz !sband kernel warnings in the journal since a time.
+sband_since() {
+    journalctl -k -q --no-pager -o cat --since "$1" 2> /dev/null | grep -c '!sband'
+}
+
+# Run one failing activation of the Steam profile. Print "<longest RTNL stall
+# in ms> <count of !sband warnings>". Return 3 if the activation succeeds.
+measure_cycle() {
+    local tmp max t0 t1 ms rc start
+    tmp=$(mktemp -d)
+    echo 0 > "$tmp/max"
+    # Globals, not locals: the EXIT trap runs after the function returns.
+    MC_TMP="$tmp" MC_SAMPLER=""
+    trap measure_cycle_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    (
+        max=0
+        while :; do
+            t0=$(date +%s%N)
+            ip link show dev lo > /dev/null 2>&1
+            t1=$(date +%s%N)
+            ms=$(( (t1 - t0) / 1000000 ))
+            if [ "$ms" -gt "$max" ]; then max=$ms; echo "$max" > "$tmp/max"; fi
+            sleep 0.1
+        done
+    ) &
+    MC_SAMPLER=$!
+    start=$(date +%s)
+    nmcli --wait 40 connection up "$PROFILE" > "$tmp/nmcli" 2>&1
+    rc=$?
+    sleep 15   # the failure path also stalls, after the activation ends
+    kill "$MC_SAMPLER" 2> /dev/null
+    wait "$MC_SAMPLER" 2> /dev/null
+    MC_SAMPLER=""
+    if [ "$rc" -eq 0 ]; then
+        nmcli connection down "$PROFILE" > /dev/null 2>&1
+        return 3
+    fi
+    printf '%s %s\n' "$(cat "$tmp/max")" "$(sband_since "@$start")"
+}
+
+# The end state after any selftest, whatever step it stopped in.
+selftest_enforce() {
+    local iface
+    recover_stale
+    reauthorize_all
+    iface=$(find_iface) || { warn "the adapter is missing. Replug it."; return 0; }
+    dm_has_ips "$(dm_read "$iface" 2> /dev/null || echo 0)" || ips_off "$iface"
+    return 0
+}
+
+selftest_restore() {
+    local what="$SELFTEST_RESTORE"
+    [ -z "$what" ] && return 0
+    SELFTEST_RESTORE=""
+    warn "restoring the workarounds..."
+    case "$what" in
+        ips) ips_off "$(find_iface)" ;;
+        mac)
+            recover_stale
+            nmcli general reload conf
+            reauthorize_all
+            cmd_replug > /dev/null
+            ;;
+    esac
+}
+
+cmd_selftest() {
+    need_root selftest
+    local yes=0 skip_mac=0 want_profile=0 arg iface on ips mac sband_on
+    for arg in "$@"; do
+        case "$arg" in
+            --yes) yes=1 ;;
+            --skip-mac) skip_mac=1 ;;
+            --profile) want_profile=1 ;;
+            *)
+                if [ "$want_profile" -eq 1 ]; then PROFILE="$arg"; want_profile=0
+                else die "unknown option: $arg"; fi
+                ;;
+        esac
+    done
+    [ "$want_profile" -eq 0 ] || die "--profile needs a name"
+    recover_stale
+    iface=$(find_iface) || die "no Steam Frame adapter ($USB_VENDOR:$USB_PRODUCT) found"
+    nmcli -t -f NAME connection show | grep -qxF "$PROFILE" ||
+        die "no NetworkManager profile named '$PROFILE'. Pair the headset in Steam first, or use --profile."
+    [ -e "$NM_CONF" ] || die "the workarounds are not installed. Run install first."
+    if [ "$yes" -ne 1 ]; then
+        log "This test causes network stalls of up to 15 s and takes about 4 minutes."
+        log "Close games and put the headset to sleep."
+        read -r -p "Continue? [y/N] " arg
+        [ "$arg" = "y" ] || [ "$arg" = "Y" ] || exit 1
+    fi
+    SELFTEST_ACTIVE=1
+    arm_traps
+
+    log "1/3  Cycle with all workarounds on..."
+    read -r on sband_on < <(measure_cycle 2>/dev/null) ||
+        die "the activation succeeded. The headset is awake. Put it to sleep and run again."
+    log "     longest stall ${on} ms"
+
+    log "2/3  Cycle with inactive power save on..."
+    SELFTEST_RESTORE=ips
+    ips_on "$iface" || die "could not turn inactive power save on for the test"
+    read -r ips _ < <(measure_cycle 2>/dev/null) || die "the activation succeeded. The headset is awake."
+    selftest_restore
+    log "     longest stall ${ips} ms"
+
+    if [ "$skip_mac" -eq 1 ]; then
+        mac="skipped"
+    else
+        log "3/3  Cycle with MAC randomization on (the adapter reattaches twice)..."
+        SELFTEST_RESTORE=mac
+        mv "$NM_CONF" "$NM_CONF.selftest"
+        nmcli general reload conf
+        nm_config_loaded && die "NetworkManager still uses the config after a reload"
+        [ -n "$(nmcli -g 802-11-wireless.cloned-mac-address connection show "$PROFILE")" ] &&
+            warn "the profile sets cloned-mac-address, so the MAC result can be too low"
+        cmd_replug > /dev/null
+        iface=$(find_iface) || die "the adapter did not come back"
+        read -r mac _ < <(measure_cycle 2>/dev/null) || die "the activation succeeded. The headset is awake."
+        selftest_restore
+        log "     longest stall ${mac} ms"
+    fi
+    SELFTEST_ACTIVE=0
+    trap - EXIT INT TERM HUP
+
+    log ""
+    log "Result for kernel $(uname -r):"
+    log "  Baseline, all workarounds on:  ${on} ms"
+    log "  Inactive power save off:       $(verdict "$ips") (${ips} ms without it)"
+    if [ "$mac" = "skipped" ]; then
+        log "  MAC randomization off:         not tested"
+    else
+        log "  MAC randomization off:         $(verdict "$mac") (${mac} ms without it)"
+    fi
+    if [ "$sband_on" -eq 0 ]; then
+        log "  Journal size cap:              no 2.4 GHz warnings seen, probably not needed"
+    else
+        log "  Journal size cap:              still needed ($sband_on warnings in one cycle)"
+    fi
+    logger -t "$PROG" "selftest $(uname -r): on=${on}ms ips=${ips}ms mac=${mac}ms sband=$sband_on"
+    log ""
+    log "If all three are not needed, run: sudo $PROG uninstall"
+}
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        status)      cmd_status ;;
+        selftest)    cmd_selftest "$@" ;;
+        install)     cmd_install ;;
+        uninstall)   cmd_uninstall ;;
+        replug)      cmd_replug ;;
+        udev-apply)  cmd_udev_apply "$@" ;;
+        hook-notice) cmd_hook_notice ;;
+        version|--version) echo "$PROG $VERSION" ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

@@ -1,0 +1,12 @@
+# Installed by SteamFrameDongleFix (steam-frame-dongle).
+# After a kernel update, remind the user to check if the workarounds are still needed.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Steam Frame dongle: kernel changed, re-test the workarounds
+When = PostTransaction
+Exec = /usr/local/bin/steam-frame-dongle hook-notice
